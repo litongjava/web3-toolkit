@@ -4,7 +4,10 @@ import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.litongjava.model.http.response.ResponseVo;
+import com.litongjava.tio.utils.environment.EnvUtils;
 import com.litongjava.tio.utils.http.HttpUtils;
+import com.litongjava.web3.consts.TrongridConsts;
+import com.litongjava.web3.model.TransactionInfo;
 
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.Request;
@@ -12,7 +15,7 @@ import okhttp3.Request;
 @Slf4j
 public class TronClient {
 
-  public static final String BASE_URL = "https://api.trongrid.io";
+  public static final String BASE_URL = EnvUtils.getStr(TrongridConsts.BASE_URL_KEY, TrongridConsts.BASE_URL);
 
   /**
    * 获取账户余额和资源
@@ -42,7 +45,7 @@ public class TronClient {
       throw new RuntimeException("获取资源失败: " + responseVo.getCode());
     }
     body = responseVo.getBodyString();
-    JSONObject res  = JSON.parseObject(body);
+    JSONObject res = JSON.parseObject(body);
     if (obj != null) {
       long freeNetLimit = res.getLongValue("freeNetLimit");
       long freeNetUsed = res.getLongValue("freeNetUsed");
@@ -62,7 +65,6 @@ public class TronClient {
     return accountInfo;
   }
 
-
   public static ResponseVo account(String address, String apiKey) {
     // 1) 账户余额
     String urlAcc = BASE_URL + "/v1/accounts/" + address;
@@ -74,7 +76,7 @@ public class TronClient {
     Request request = builderAcc.build();
     return HttpUtils.call(request);
   }
-  
+
   public static ResponseVo accountResources(String address, String apiKey) {
     // TronGrid 代理的 JavaTron 接口（主网）
     String url = BASE_URL + "/wallet/getaccountresource";
@@ -91,6 +93,94 @@ public class TronClient {
     if (apiKey != null && !apiKey.isEmpty()) {
       rb.addHeader("TRON-PRO-API-KEY", apiKey);
     }
-    return com.litongjava.tio.utils.http.HttpUtils.call(rb.build());
+    return HttpUtils.call(rb.build());
   }
+
+  /**
+   * Check if the specified wallet address has a successful transaction with the
+   * given amount.
+   *
+   * @param walletAddress the wallet address (Base58)
+   * @param amountTRX     the transaction amount (in TRX, not SUN)
+   * @param apiKey        optional TRON-PRO-API-KEY, can be null
+   * @return TransactionInfo if at least one matching SUCCESS transaction is
+   *         found, otherwise null
+   */
+  public static TransactionInfo getTransactionByAddress(String walletAddress, double amountTRX, String apiKey) {
+    log.info("Checking transactions for address={}, amount={} TRX", walletAddress, amountTRX);
+
+    String url = BASE_URL + "/v1/accounts/" + walletAddress + "/transactions";
+    Request.Builder builder = new Request.Builder().url(url).get();
+    if (apiKey != null && !apiKey.isEmpty()) {
+      builder.addHeader("TRON-PRO-API-KEY", apiKey);
+    }
+    Request request = builder.build();
+
+    try {
+      ResponseVo resp = HttpUtils.call(request);
+      if (!resp.isOk()) {
+        log.error("HTTP request failed, code={}", resp.getCode());
+        return null;
+      }
+
+      String body = resp.getBodyString();
+      JSONObject json = JSON.parseObject(body);
+      JSONArray data = json.getJSONArray("data");
+      if (data == null || data.isEmpty()) {
+        log.info("No transaction data found for address={}", walletAddress);
+        return null;
+      }
+
+      long targetAmountSun = (long) (amountTRX * 1_000_000L);
+
+      for (int i = 0; i < data.size(); i++) {
+        JSONObject tx = data.getJSONObject(i);
+
+        // 1. Check status SUCCESS
+        JSONArray retArr = tx.getJSONArray("ret");
+        if (retArr == null || retArr.isEmpty())
+          continue;
+        String contractRet = retArr.getJSONObject(0).getString("contractRet");
+        if (!"SUCCESS".equalsIgnoreCase(contractRet))
+          continue;
+
+        // 2. Parse contract value
+        JSONObject raw = tx.getJSONObject("raw_data");
+        if (raw == null)
+          continue;
+        JSONArray contractArr = raw.getJSONArray("contract");
+        if (contractArr == null || contractArr.isEmpty())
+          continue;
+        JSONObject contract = contractArr.getJSONObject(0);
+        JSONObject parameter = contract.getJSONObject("parameter");
+        if (parameter == null)
+          continue;
+        JSONObject value = parameter.getJSONObject("value");
+        if (value == null)
+          continue;
+
+        long amountSun = value.getLongValue("amount");
+
+        // 3. Compare target
+        if (amountSun == targetAmountSun) {
+          String txID = tx.getString("txID");
+          log.info("Found SUCCESS transaction: txID={}, amountSun={}", txID, amountSun);
+
+          TransactionInfo info = new TransactionInfo();
+          info.setTxID(txID);
+          info.setAmountSun(amountSun);
+          info.setAmountTRX(amountTRX);
+          info.setContractRet(contractRet);
+          return info;
+        }
+      }
+
+      log.info("No matching SUCCESS transaction found for amount={} TRX", amountTRX);
+      return null;
+    } catch (Exception e) {
+      log.error("Error while checking transaction", e);
+      return null;
+    }
+  }
+
 }
