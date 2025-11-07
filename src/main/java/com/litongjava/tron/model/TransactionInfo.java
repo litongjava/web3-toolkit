@@ -1,4 +1,6 @@
-package com.litongjava.web3.model;
+package com.litongjava.tron.model;
+
+import java.math.BigDecimal;
 
 import lombok.Data;
 
@@ -9,6 +11,6 @@ import lombok.Data;
 public class TransactionInfo {
   private String txID;
   private long amountSun;
-  private double amountTRX;
+  private BigDecimal amountTRX;
   private String contractRet;
 }

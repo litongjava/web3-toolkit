@@ -1,4 +1,4 @@
-package com.litongjava.web3.model;
+package com.litongjava.tron.model;
 
 /** 返回结果对象 */
 public class Web3WalletAddress {

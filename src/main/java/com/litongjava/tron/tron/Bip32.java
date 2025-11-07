@@ -1,4 +1,4 @@
-package com.litongjava.web3.tron;
+package com.litongjava.tron.tron;
 
 import java.security.Security;
 import java.util.ArrayList;
@@ -11,8 +11,8 @@ import org.web3j.crypto.Hash;
 import org.web3j.crypto.MnemonicUtils;
 import org.web3j.utils.Numeric;
 
-import com.litongjava.web3.model.Web3WalletAddress;
-import com.litongjava.web3.utils.Base58Utils;
+import com.litongjava.tron.model.Web3WalletAddress;
+import com.litongjava.tron.utils.Base58Utils;
 
 /**
  * TRON HD 派生封装
@@ -34,6 +34,8 @@ public class Bip32 {
    * @param account    账户号（会加硬化：account'）
    * @param change     0=外部链，1=内部链
    * @param index      地址索引
+   * 
+   * 
    */
   public static Web3WalletAddress bip32(String mnemonic, String passphrase, int account, int change, int index) {
     // 1) seed
@@ -45,10 +47,10 @@ public class Bip32 {
     // 3) path m/44'/195'/{account}'/{change}/{index}
     int[] path = new int[] { 44 | HARDENED_BIT, TRON_COIN_TYPE | HARDENED_BIT, account | HARDENED_BIT, change, index };
 
-    // 4) derive
+    // 4) derive 从根密钥生成某个子密钥
     Bip32ECKeyPair child = Bip32ECKeyPair.deriveKeyPair(master, path);
 
-    // 5) pub -> TRON address
+    // 5) pub -> TRON address 公钥
     byte[] pubUncompressed = child.getPublicKeyPoint().getEncoded(false);
     String address = generateTronAddress(pubUncompressed);
 
@@ -80,19 +82,5 @@ public class Bip32 {
     System.arraycopy(addressBytes, 0, addressWithPrefix, 1, 20);
 
     return Base58Utils.base58CheckEncode(addressWithPrefix);
-  }
-
-  /** 示例用法 */
-  public static void main(String[] args) {
-    String mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    String passphrase = ""; // 或 "your-passphrase"
-
-    // 单个地址
-    Web3WalletAddress r = bip32(mnemonic, passphrase, 0, 0, 0);
-    System.out.println("Single -> " + r);
-
-    // 批量生成前5个地址
-    List<Web3WalletAddress> batch = bip32Batch(mnemonic, passphrase, 0, 0, 0, 5);
-    batch.forEach(x -> System.out.println("Batch  -> " + x));
   }
 }

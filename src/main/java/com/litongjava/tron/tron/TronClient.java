@@ -1,4 +1,6 @@
-package com.litongjava.web3.tron;
+package com.litongjava.tron.tron;
+
+import java.math.BigDecimal;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
@@ -6,8 +8,8 @@ import com.alibaba.fastjson2.JSONObject;
 import com.litongjava.model.http.response.ResponseVo;
 import com.litongjava.tio.utils.environment.EnvUtils;
 import com.litongjava.tio.utils.http.HttpUtils;
-import com.litongjava.web3.consts.TrongridConsts;
-import com.litongjava.web3.model.TransactionInfo;
+import com.litongjava.tron.consts.TrongridConsts;
+import com.litongjava.tron.model.TransactionInfo;
 
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.Request;
@@ -106,11 +108,13 @@ public class TronClient {
    * @return TransactionInfo if at least one matching SUCCESS transaction is
    *         found, otherwise null
    */
-  public static TransactionInfo getTransactionByAddress(String walletAddress, double amountTRX, String apiKey) {
-    log.info("Checking transactions for address={}, amount={} TRX", walletAddress, amountTRX);
+  public static TransactionInfo getTransactionByAddress(String walletAddress, BigDecimal amountTRX, String apiKey) {
 
     String url = BASE_URL + "/v1/accounts/" + walletAddress + "/transactions";
     Request.Builder builder = new Request.Builder().url(url).get();
+    if (apiKey == null) {
+      apiKey = EnvUtils.getStr(TrongridConsts.TRONGRID_API_KEY);
+    }
     if (apiKey != null && !apiKey.isEmpty()) {
       builder.addHeader("TRON-PRO-API-KEY", apiKey);
     }
@@ -119,7 +123,7 @@ public class TronClient {
     try {
       ResponseVo resp = HttpUtils.call(request);
       if (!resp.isOk()) {
-        log.error("HTTP request failed, code={}", resp.getCode());
+        log.error("HTTP request failed, code={},{}", resp.getCode(), resp.getBodyString());
         return null;
       }
 
@@ -127,45 +131,49 @@ public class TronClient {
       JSONObject json = JSON.parseObject(body);
       JSONArray data = json.getJSONArray("data");
       if (data == null || data.isEmpty()) {
-        log.info("No transaction data found for address={}", walletAddress);
         return null;
       }
 
-      long targetAmountSun = (long) (amountTRX * 1_000_000L);
+      long targetAmountSun = amountTRX.multiply(BigDecimal.valueOf(1_000_000L)).longValue();
 
       for (int i = 0; i < data.size(); i++) {
         JSONObject tx = data.getJSONObject(i);
 
         // 1. Check status SUCCESS
         JSONArray retArr = tx.getJSONArray("ret");
-        if (retArr == null || retArr.isEmpty())
+        if (retArr == null || retArr.isEmpty()) {
           continue;
+        }
+
         String contractRet = retArr.getJSONObject(0).getString("contractRet");
-        if (!"SUCCESS".equalsIgnoreCase(contractRet))
+        if (!"SUCCESS".equalsIgnoreCase(contractRet)) {
           continue;
+        }
 
         // 2. Parse contract value
         JSONObject raw = tx.getJSONObject("raw_data");
-        if (raw == null)
+        if (raw == null) {
           continue;
+        }
         JSONArray contractArr = raw.getJSONArray("contract");
-        if (contractArr == null || contractArr.isEmpty())
+        if (contractArr == null || contractArr.isEmpty()) {
           continue;
+        }
         JSONObject contract = contractArr.getJSONObject(0);
         JSONObject parameter = contract.getJSONObject("parameter");
-        if (parameter == null)
+        if (parameter == null) {
           continue;
+        }
         JSONObject value = parameter.getJSONObject("value");
-        if (value == null)
+        if (value == null) {
           continue;
+        }
 
         long amountSun = value.getLongValue("amount");
 
         // 3. Compare target
         if (amountSun == targetAmountSun) {
           String txID = tx.getString("txID");
-          log.info("Found SUCCESS transaction: txID={}, amountSun={}", txID, amountSun);
-
           TransactionInfo info = new TransactionInfo();
           info.setTxID(txID);
           info.setAmountSun(amountSun);
