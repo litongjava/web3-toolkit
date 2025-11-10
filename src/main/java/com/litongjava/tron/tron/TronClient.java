@@ -1,6 +1,16 @@
 package com.litongjava.tron.tron;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.security.MessageDigest;
+
+import org.bouncycastle.crypto.digests.SHA256Digest;
+import org.bouncycastle.crypto.params.ECPrivateKeyParameters;
+import org.bouncycastle.crypto.signers.ECDSASigner;
+import org.bouncycastle.crypto.signers.HMacDSAKCalculator;
+import org.bouncycastle.math.ec.ECPoint;
+import org.bouncycastle.util.Arrays;
+import org.bouncycastle.util.encoders.Hex;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
@@ -9,10 +19,14 @@ import com.litongjava.model.http.response.ResponseVo;
 import com.litongjava.tio.utils.environment.EnvUtils;
 import com.litongjava.tio.utils.http.HttpUtils;
 import com.litongjava.tron.consts.TrongridConsts;
-import com.litongjava.tron.model.TransactionInfo;
+import com.litongjava.tron.model.TronRawData;
+import com.litongjava.tron.model.TronTransaction;
+import com.litongjava.tron.model.TronTransactionInfo;
 
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.MediaType;
 import okhttp3.Request;
+import okhttp3.RequestBody;
 
 @Slf4j
 public class TronClient {
@@ -88,10 +102,9 @@ public class TronClient {
     payload.put("address", address);
     payload.put("visible", true);
 
-    okhttp3.RequestBody body = okhttp3.RequestBody.create(payload.toJSONString(),
-        okhttp3.MediaType.parse("application/json; charset=utf-8"));
+    RequestBody body = RequestBody.create(payload.toJSONString(), MediaType.parse("application/json; charset=utf-8"));
 
-    okhttp3.Request.Builder rb = new okhttp3.Request.Builder().url(url).post(body);
+    Request.Builder rb = new Request.Builder().url(url).post(body);
     if (apiKey != null && !apiKey.isEmpty()) {
       rb.addHeader("TRON-PRO-API-KEY", apiKey);
     }
@@ -108,7 +121,7 @@ public class TronClient {
    * @return TransactionInfo if at least one matching SUCCESS transaction is
    *         found, otherwise null
    */
-  public static TransactionInfo getTransactionByAddress(String walletAddress, BigDecimal amountTRX, String apiKey) {
+  public static TronTransactionInfo getTransactionByAddress(String walletAddress, BigDecimal amountTRX, String apiKey) {
 
     String url = BASE_URL + "/v1/accounts/" + walletAddress + "/transactions";
     Request.Builder builder = new Request.Builder().url(url).get();
@@ -174,7 +187,7 @@ public class TronClient {
         // 3. Compare target
         if (amountSun == targetAmountSun) {
           String txID = tx.getString("txID");
-          TransactionInfo info = new TransactionInfo();
+          TronTransactionInfo info = new TronTransactionInfo();
           info.setTxID(txID);
           info.setAmountSun(amountSun);
           info.setAmountTRX(amountTRX);
@@ -189,6 +202,218 @@ public class TronClient {
       log.error("Error while checking transaction", e);
       return null;
     }
+  }
+
+  public static String transferTrx(String fromAddress, String toAddress, long amountSun, String privateKeyHex) {
+    return transferTrx(fromAddress, toAddress, amountSun, privateKeyHex, null);
+  }
+
+  public static String transferTrx(String fromAddress, String toAddress, long amountSun, String privateKeyHex, String apiKey) {
+    if (apiKey == null || apiKey.isEmpty()) {
+      apiKey = EnvUtils.getStr(TrongridConsts.TRONGRID_API_KEY);
+    }
+    try {
+      ResponseVo createResp = createTransaction(fromAddress, toAddress, amountSun, apiKey);
+      if (!createResp.isOk()) {
+        log.error("createtransaction failed: code={}, body={}", createResp.getCode(), createResp.getBodyString());
+        return null;
+      }
+      TronTransaction unsignedTx = JSON.parseObject(createResp.getBodyString(), TronTransaction.class);
+      String raw_data_hex = unsignedTx.getRaw_data_hex();
+      if (raw_data_hex == null) {
+        log.error("invalid unsigned tx: {}", createResp.getBodyString());
+        return null;
+      }
+
+      // 2) 计算 txID = SHA256(raw_data)
+      byte[] rawData = Hex.decode(raw_data_hex);
+      byte[] txIdBytes = sha256(rawData);
+      String txIdHex = Hex.toHexString(txIdBytes);
+
+      // 3) 使用 secp256k1 对 txID 做签名，得到 r||s||v (65字节)
+      byte[] privKeyBytes = Hex.decode(privateKeyHex);
+      String sigHex = signTron(txIdBytes, privKeyBytes); // r(32)+s(32)+v(1) => hex
+
+      TronRawData raw_data = unsignedTx.getRaw_data();
+
+      ResponseVo bcResp = broadcastTransaction(txIdHex, raw_data, raw_data_hex, sigHex, apiKey);
+      String bodyString = bcResp.getBodyString();
+      if (!bcResp.isOk()) {
+        log.error("broadcasttransaction failed: code={}, body={}", bcResp.getCode(), bodyString);
+        return null;
+      }
+      JSONObject bc = JSON.parseObject(bodyString);
+      boolean result = bc.getBooleanValue("result");
+      String txid = bc.getString("txid");
+      if (!result || txid == null) {
+        log.error("broadcast failed: {}", bodyString);
+        return null;
+      }
+      return txid;
+    } catch (Exception e) {
+      log.error("transferTrx local-sign error", e);
+      return null;
+    }
+  }
+
+  public static ResponseVo broadcastTransaction(String txIdHex, TronRawData raw_data, String raw_data_hex, String sigHex, String apiKey) {
+    // 4) 组装广播交易对象
+    JSONObject toBroadcast = new JSONObject();
+    toBroadcast.put("visible", true);
+    toBroadcast.put("txID", txIdHex);
+    toBroadcast.put("raw_data", raw_data);
+    toBroadcast.put("raw_data_hex", raw_data_hex);
+    // Tron 要求 signature 是数组
+    toBroadcast.put("signature", new JSONArray() {
+      {
+        add(sigHex);
+      }
+    });
+
+    String jsonString = toBroadcast.toJSONString();
+    RequestBody bodyBroadcast = RequestBody.create(jsonString, MediaType.parse("application/json; charset=utf-8"));
+    Request.Builder rbBroadcast = new Request.Builder().url(BASE_URL + "/wallet/broadcasttransaction").post(bodyBroadcast);
+    if (apiKey != null && !apiKey.isEmpty()) {
+      rbBroadcast.addHeader("TRON-PRO-API-KEY", apiKey);
+    }
+    ResponseVo bcResp = HttpUtils.call(rbBroadcast.build());
+    return bcResp;
+  }
+
+  public static ResponseVo createTransaction(String fromAddress, String toAddress, long amountSun, String apiKey) {
+    // 1) 创建交易（保持与原来一致）
+    JSONObject createPayload = new JSONObject();
+    createPayload.put("visible", true);
+    createPayload.put("to_address", toAddress);
+    createPayload.put("owner_address", fromAddress);
+    createPayload.put("amount", amountSun);
+
+    String jsonString = createPayload.toJSONString();
+    RequestBody bodyCreate = RequestBody.create(jsonString, MediaType.parse("application/json; charset=utf-8"));
+    Request.Builder rbCreate = new Request.Builder().url(BASE_URL + "/wallet/createtransaction").post(bodyCreate);
+    if (apiKey != null && !apiKey.isEmpty()) {
+      rbCreate.addHeader("TRON-PRO-API-KEY", apiKey);
+    }
+    ResponseVo createResp = HttpUtils.call(rbCreate.build());
+    return createResp;
+  }
+
+  /** 对输入做单轮 SHA-256 */
+  private static byte[] sha256(byte[] input) {
+    try {
+      MessageDigest md = MessageDigest.getInstance("SHA-256");
+      return md.digest(input);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  /**
+   * Tron 签名：对 txID 做 ECDSA(secp256k1) 签名，输出 r||s||v（v=27+recId）
+   * 参考：ECDSA(secp256k1) + SHA-256；签名放在 signature[0] 以 hex 拼接 r,s,v。
+   */
+  private static String signTron(byte[] hash32, byte[] privKey) {
+    // secp256k1 曲线与参数
+    var params = org.bouncycastle.crypto.ec.CustomNamedCurves.getByName("secp256k1");
+    var domain = new org.bouncycastle.crypto.params.ECDomainParameters(params.getCurve(), params.getG(), params.getN(), params.getH());
+
+    // RFC6979 确定性 k
+    ECDSASigner signer = new ECDSASigner(new HMacDSAKCalculator(new SHA256Digest()));
+    BigInteger d = new BigInteger(1, privKey);
+    signer.init(true, new ECPrivateKeyParameters(d, domain));
+
+    BigInteger[] rs = signer.generateSignature(hash32);
+    BigInteger r = rs[0];
+    BigInteger s = rs[1];
+
+    // 规范化 s 到低 s（低于 n/2）
+    BigInteger halfN = params.getN().shiftRight(1);
+    if (s.compareTo(halfN) > 0) {
+      s = params.getN().subtract(s);
+    }
+
+    // 计算 recovery id（0/1/2/3），以恢复公钥判断
+    int recId = calcRecId(hash32, r, s, d, params);
+
+    // v = 27 + recId
+    int v = 27 + recId;
+
+    byte[] rBytes = toFixed(r, 32);
+    byte[] sBytes = toFixed(s, 32);
+    byte[] sig65 = new byte[65];
+    System.arraycopy(rBytes, 0, sig65, 0, 32);
+    System.arraycopy(sBytes, 0, sig65, 32, 32);
+    sig65[64] = (byte) v;
+
+    return Hex.toHexString(sig65);
+  }
+
+  /** 计算 recovery id：遍历 0..3 尝试恢复公钥并匹配 */
+  private static int calcRecId(byte[] hash32, BigInteger r, BigInteger s, BigInteger d, org.bouncycastle.asn1.x9.X9ECParameters params) {
+
+    ECPoint pub = params.getG().multiply(d).normalize();
+    for (int recId = 0; recId < 4; recId++) {
+      ECPoint Q = recoverFromSignature(recId, r, s, hash32, params);
+      if (Q != null && Q.normalize().equals(pub)) {
+        return recId;
+      }
+    }
+    // 找不到就回退 0（通常不会）
+    return 0;
+  }
+
+  /** 根据 (recId,r,s,hash) 恢复公钥（标准 secp256k1 做法） */
+  private static ECPoint recoverFromSignature(int recId, BigInteger r, BigInteger s, byte[] hash,
+      org.bouncycastle.asn1.x9.X9ECParameters params) {
+
+    BigInteger n = params.getN();
+    BigInteger i = BigInteger.valueOf((long) recId / 2);
+    BigInteger x = r.add(i.multiply(n));
+
+    var curve = params.getCurve();
+    BigInteger prime = ((org.bouncycastle.math.ec.custom.sec.SecP256K1Curve) curve).getQ();
+    if (x.compareTo(prime) >= 0)
+      return null;
+
+    ECPoint R = decompressKey(x, (recId & 1) == 1, curve);
+    if (!R.multiply(n).isInfinity())
+      return null;
+
+    BigInteger e = new BigInteger(1, hash);
+    BigInteger rInv = r.modInverse(n);
+    BigInteger srInv = s.multiply(rInv).mod(n);
+    BigInteger eNeg = n.subtract(e).multiply(rInv).mod(n);
+
+    ECPoint Q = params.getG().multiply(eNeg).add(R.multiply(srInv)).normalize();
+    return Q;
+  }
+
+  private static ECPoint decompressKey(BigInteger xBN, boolean yBit, org.bouncycastle.math.ec.ECCurve curve) {
+    byte[] compEnc = Hex.decode("02" + leftPadHex(xBN.toString(16), 64));
+    if (yBit)
+      compEnc[0] = 0x03;
+    return curve.decodePoint(compEnc);
+  }
+
+  private static byte[] toFixed(BigInteger v, int size) {
+    byte[] b = v.toByteArray();
+    if (b.length == size)
+      return b;
+    if (b.length == size + 1 && b[0] == 0)
+      return Arrays.copyOfRange(b, 1, b.length);
+    byte[] out = new byte[size];
+    System.arraycopy(b, Math.max(0, b.length - size), out, Math.max(0, size - b.length), Math.min(size, b.length));
+    return out;
+  }
+
+  private static String leftPadHex(String s, int len) {
+    if (s.length() >= len)
+      return s;
+    StringBuilder sb = new StringBuilder(len);
+    for (int i = 0; i < len - s.length(); i++)
+      sb.append('0');
+    sb.append(s);
+    return sb.toString();
   }
 
 }
